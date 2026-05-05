@@ -8,3 +8,4 @@ opencv-python
 pyzbar
 numpy
 Pillow
+tornado
