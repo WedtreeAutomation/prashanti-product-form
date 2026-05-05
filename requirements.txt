@@ -1,0 +1,10 @@
+streamlit
+python-dotenv
+pandas
+sqlalchemy
+pyodbc
+streamlit-webrtc
+opencv-python
+pyzbar
+numpy
+Pillow
