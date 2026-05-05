@@ -5,7 +5,6 @@ sqlalchemy
 pyodbc
 streamlit-webrtc
 opencv-python-headless
-pyzbar
 numpy
 Pillow
 tornado
