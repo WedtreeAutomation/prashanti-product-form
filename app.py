@@ -5,10 +5,6 @@ import xmlrpc.client
 import pandas as pd
 from sqlalchemy import create_engine, text
 import urllib.parse
-from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, WebRtcMode
-import cv2
-from pyzbar.pyzbar import decode
-import numpy as np
 
 # Load environment variables
 load_dotenv()
@@ -27,35 +23,19 @@ SQL_ENDPOINT = os.getenv('SQL_ENDPOINT')
 DATABASE = os.getenv('DATABASE')
 SCHEMA = os.getenv('SCHEMA', 'dbo')
 
-# Barcode Scanner Class
-class BarcodeScanner(VideoTransformerBase):
-    def __init__(self):
-        self.barcode_data = None
-        
-    def recv(self, frame):
-        img = frame.to_ndarray(format="bgr24")
-        
-        # Decode barcodes
-        barcodes = decode(img)
-        
-        for barcode in barcodes:
-            # Extract barcode data
-            self.barcode_data = barcode.data.decode('utf-8')
-            
-            # Draw rectangle around barcode
-            points = barcode.polygon
-            if len(points) == 4:
-                pts = np.array([(point.x, point.y) for point in points], np.int32)
-                cv2.polylines(img, [pts], True, (0, 255, 0), 2)
-            
-            # Put text near barcode
-            cv2.putText(img, self.barcode_data, (barcode.rect.left, barcode.rect.top - 10),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-            
-            # Stop scanning after first barcode is found
-            break
-            
-        return img
+# Try to import barcode libraries with fallback
+try:
+    import cv2
+    from pyzbar.pyzbar import decode
+    import numpy as np
+    BARCODE_AVAILABLE = True
+except ImportError as e:
+    BARCODE_AVAILABLE = False
+    st.warning(f"Barcode scanning limited: {str(e)}")
+    
+    # Provide a fallback
+    def decode(img_array):
+        return []
 
 # Odoo Connection
 @st.cache_resource
@@ -214,7 +194,8 @@ def check_table_exists(engine):
 
 # Streamlit UI
 st.set_page_config(page_title="Product Registration", layout="wide")
-# Add custom CSS for better mobile experience and reduced fonts
+
+# Add custom CSS for better mobile experience
 st.markdown("""
 <style>
     /* Reduce overall font sizes for mobile */
@@ -326,6 +307,14 @@ st.markdown("""
 st.title("📦 Product Registration with Barcode Scanner")
 st.markdown("---")
 
+# Show barcode availability warning if needed
+if not BARCODE_AVAILABLE:
+    st.warning("""
+    ⚠️ **Barcode scanning is limited in this environment**
+    
+    Manual entry is still fully functional. For barcode scanning, please use the camera input option.
+    """)
+
 # Initialize session state
 if 'scanned_data' not in st.session_state:
     st.session_state.scanned_data = None
@@ -353,42 +342,43 @@ if uid and models:
         st.subheader("📷 Scan Barcode with Camera")
         st.info("📱 Use your phone camera to scan the barcode")
         
-        # Option 1: Camera input (simplest)
+        # Camera input
         barcode_image = st.camera_input("Position the barcode in frame", key="mobile_scanner")
         
         if barcode_image:
-            from PIL import Image
-            import numpy as np
-            from pyzbar.pyzbar import decode
-            
-            # Convert and scan
-            image = Image.open(barcode_image)
-            img_array = np.array(image)
-            barcodes = decode(img_array)
-            
-            if barcodes:
-                scanned_value = barcodes[0].data.decode('utf-8')
-                # st.success(f"✅ Barcode detected: {scanned_value}")
-                if st.session_state.get('scanned_lot') != scanned_value:
-                    st.session_state.mapping_sku_input = ""
-                    st.session_state.shelf_info_input = ""
+            if BARCODE_AVAILABLE:
+                from PIL import Image
+                import numpy as np
                 
-                # Your existing lookup logic
-                with st.spinner("Fetching product details..."):
-                    product_data = get_product_by_lot(scanned_value.strip(), uid, models)
+                # Convert and scan
+                image = Image.open(barcode_image)
+                img_array = np.array(image)
+                barcodes = decode(img_array)
+                
+                if barcodes:
+                    scanned_value = barcodes[0].data.decode('utf-8')
+                    if st.session_state.get('scanned_lot') != scanned_value:
+                        st.session_state.mapping_sku_input = ""
+                        st.session_state.shelf_info_input = ""
                     
-                    if product_data:
-                        st.session_state.scanned_data = product_data
-                        st.session_state.scanned_lot = scanned_value
-                        st.success(f"✅ Product found: {product_data['product_name']}")
-                    else:
-                        st.error("❌ No product found for this barcode")
-                        st.session_state.scanned_data = None
+                    with st.spinner("Fetching product details..."):
+                        product_data = get_product_by_lot(scanned_value.strip(), uid, models)
+                        
+                        if product_data:
+                            st.session_state.scanned_data = product_data
+                            st.session_state.scanned_lot = scanned_value
+                            st.success(f"✅ Product found: {product_data['product_name']}")
+                        else:
+                            st.error("❌ No product found for this barcode")
+                            st.session_state.scanned_data = None
+                else:
+                    st.error("❌ No barcode detected. Please try again and ensure good lighting.")
             else:
-                st.error("❌ No barcode detected. Please try again and ensure good lighting.")
+                st.error("❌ Barcode scanning is not available in this environment. Please use Manual Entry tab.")
         
         st.markdown("---")
         st.caption("💡 Tip: Ensure good lighting and hold the phone steady")
+    
     with tab2:
         st.subheader("⌨️ Manual Lot Number Entry")
         
@@ -402,10 +392,10 @@ if uid and models:
         # Lookup button
         if st.button("🔍 Lookup Product", type="primary", use_container_width=True):
             if lot_input:
-                 # ADD THESE 2 LINES:
                 if st.session_state.get('scanned_lot') != lot_input:
                     st.session_state.mapping_sku_input = ""
                     st.session_state.shelf_info_input = ""
+                    
                 with st.spinner("Fetching product details from Odoo..."):
                     product_data = get_product_by_lot(lot_input.strip(), uid, models)
                     
@@ -484,47 +474,6 @@ if uid and models:
                     st.warning("⚠️ Please fill Mapping SKU field (Required)")
     else:
         st.info("👆 Scan a barcode using camera or enter lot number manually to see product details")
-    
-    # # Display existing records
-    # st.markdown("---")
-    # st.subheader("📊 Existing Product Records")
-    
-    # # Refresh button
-    # col_refresh, col_empty = st.columns([1, 4])
-    # with col_refresh:
-    #     if st.button("🔄 Refresh Data", use_container_width=True):
-    #         st.rerun()
-    
-    # # Show data table
-    # df = show_existing_data()
-    # if df is not None and not df.empty:
-    #     st.dataframe(
-    #         df,
-    #         use_container_width=True,
-    #         column_config={
-    #             "lot_no": "🏷️ Lot Number",
-    #             "product_name": "📦 Product Name",
-    #             "selling_price": st.column_config.NumberColumn("💰 Selling Price (₹)", format="₹%d"),
-    #             "mapping_sku": "📌 Mapping SKU",
-    #             "shelf_info": "📍 Shelf Info"
-    #         },
-    #         hide_index=True
-    #     )
-        
-    #     # Download option
-    #     csv = df.to_csv(index=False)
-    #     st.download_button(
-    #         label="📥 Download Data as CSV",
-    #         data=csv,
-    #         file_name="product_data_export.csv",
-    #         mime="text/csv",
-    #         use_container_width=True
-    #     )
-        
-    #     # Show record count
-    #     st.info(f"📊 Total records: {len(df)}")
-    # else:
-    #     st.info("No records found in the database. Scan and save your first product!")
 
 else:
     st.error("Failed to connect to Odoo. Please check your credentials.")
