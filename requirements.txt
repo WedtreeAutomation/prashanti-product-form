@@ -4,7 +4,7 @@ pandas
 sqlalchemy
 pyodbc
 streamlit-webrtc
-opencv-python-headless
-numpy
+opencv-python
+pyrxing
 Pillow
-tornado
+numpy
