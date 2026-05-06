@@ -4,7 +4,7 @@ pandas
 sqlalchemy
 pyodbc
 streamlit-webrtc
-opencv-python-headless==4.13.0.92
+opencv-python
 pyrxing
 Pillow
 numpy
