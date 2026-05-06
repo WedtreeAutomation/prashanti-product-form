@@ -529,7 +529,7 @@ if uid and models:
         # </script>
         # """, unsafe_allow_html=True)
         # Lookup button
-        if st.button("🔍 Lookup Product", type="primary", use_container_width=True):
+        if st.button("🔍 Lookup Product", type="primary", width='stretch'):
             if lot_input:
                 if st.session_state.get('scanned_lot') != lot_input:
                     st.session_state.mapping_sku_input = ""
@@ -607,7 +607,7 @@ if uid and models:
             
             # Submit button
             submit_label = "🔄 Update Database" if st.session_state.existing_record_data else "💾 Save to Database"
-            submitted = st.form_submit_button(submit_label, type="primary", use_container_width=True)
+            submitted = st.form_submit_button(submit_label, type="primary", width='stretch')
             
             if submitted:
                 if mapping_sku:
@@ -647,7 +647,7 @@ if uid and models:
     # Refresh button
     col_refresh, col_empty = st.columns([1, 4])
     with col_refresh:
-        if st.button("🔄 Refresh Data", use_container_width=True):
+        if st.button("🔄 Refresh Data", width='stretch'):
             st.rerun()
     
     # Show data table
@@ -657,7 +657,7 @@ if uid and models:
             df = df.drop(columns=['product_qty'])
         st.dataframe(
             df,
-            use_container_width=True,
+            width='stretch',
             column_config={
                 "lot_no": "🏷️ Lot Number",
                 "product_name": "📦 Product Name",
@@ -676,7 +676,7 @@ if uid and models:
             data=csv,
             file_name="product_data_export.csv",
             mime="text/csv",
-            use_container_width=True
+            width='stretch'
         )
         
         # Show record count
