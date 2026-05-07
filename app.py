@@ -7,10 +7,12 @@ from sqlalchemy import create_engine, text
 import urllib.parse
 from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, WebRtcMode
 import cv2
-# from pyzbar.pyzbar import decode
 import pyrxing
 from PIL import Image
 import numpy as np
+import threading
+import time
+import queue
 
 # Load environment variables
 load_dotenv()
@@ -29,672 +31,659 @@ SQL_ENDPOINT = os.getenv('SQL_ENDPOINT')
 DATABASE = os.getenv('DATABASE')
 SCHEMA = os.getenv('SCHEMA', 'dbo')
 
-# Barcode Scanner Class
+# ---------------------------------------------------------------------------
+# Real-time Barcode Scanner (streamlit-webrtc VideoTransformer)
+# ---------------------------------------------------------------------------
+
 class BarcodeScanner(VideoTransformerBase):
+    """
+    Processes video frames in a background thread.
+    Detected barcode values are pushed to a thread-safe queue consumed by the UI.
+    Draws a green overlay on the frame when a barcode is detected.
+    """
+
     def __init__(self):
-        self.barcode_data = None
-        
+        self.result_queue: queue.Queue = queue.Queue(maxsize=1)
+        self._last_value: str | None = None
+        self._cooldown: float = 0.0          # avoid re-triggering same barcode
+        self._lock = threading.Lock()
+
     def recv(self, frame):
         img = frame.to_ndarray(format="bgr24")
-        
-        pil_image = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-        result = pyrxing.read_barcode(pil_image)
-        
-        if result:
-            self.barcode_data = result.text
-        
+
+        now = time.monotonic()
+        if now >= self._cooldown:
+            pil_img = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+            result = pyrxing.read_barcode(pil_img)
+
+            if result and result.text:
+                value = result.text.strip()
+                with self._lock:
+                    if value != self._last_value:
+                        self._last_value = value
+                        # Don't block; discard if queue is full (old value)
+                        try:
+                            self.result_queue.get_nowait()
+                        except queue.Empty:
+                            pass
+                        self.result_queue.put_nowait(value)
+                        self._cooldown = now + 3.0   # 3-second cooldown per barcode
+
+                # Draw green success overlay
+                h, w = img.shape[:2]
+                cv2.rectangle(img, (0, 0), (w, h), (0, 255, 0), 8)
+                cv2.putText(
+                    img, f"SCANNED: {value[:30]}",
+                    (10, h - 20), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7, (0, 255, 0), 2, cv2.LINE_AA
+                )
+
         return img
-        
-# Odoo Connection
+
+
+# ---------------------------------------------------------------------------
+# Odoo Helpers
+# ---------------------------------------------------------------------------
+
 @st.cache_resource
 def get_odoo_connection():
-    """Establish connection to Odoo"""
     try:
         common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
         models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
-        
         uid = common.authenticate(ODOO_DB, ODOO_USERNAME, ODOO_PASSWORD, {})
         if not uid:
             st.error("❌ Odoo Authentication Failed")
             return None, None
-            
         return uid, models
     except Exception as e:
-        st.error(f"❌ Odoo Connection Error: {str(e)}")
+        st.error(f"❌ Odoo Connection Error: {e}")
         return None, None
 
-def get_product_by_lot(lot_no, uid, models):
-    """Fetch product details from Odoo using lot number from stock.lot model"""
+
+def get_product_by_lot(lot_no: str, uid, models):
     try:
-        # Search in stock.lot model
         lot = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD,
             'stock.lot', 'search_read',
             [[['name', '=', lot_no]]],
             {'fields': ['id', 'name', 'product_id', 'product_qty']}
         )
-        
-        if lot:
-            # Extract product details
-            product_info = lot[0]
-            product_name = ""
-            selling_price = 0
-            product_qty = 0
-            
-            # Get product name from product_id
-            if product_info.get('product_id'):
-                product_id = product_info['product_id'][0] if isinstance(product_info['product_id'], (list, tuple)) else product_info['product_id']
-                
-                product = models.execute_kw(
-                    ODOO_DB, uid, ODOO_PASSWORD,
-                    'product.product', 'search_read',
-                    [[['id', '=', product_id]]],
-                    {'fields': ['id', 'name', 'list_price', 'standard_price', 'default_code', 'qty_available']}
+        if not lot:
+            return None
+
+        product_info = lot[0]
+        product_name = ""
+        selling_price = 0
+        product_qty = 0
+
+        if product_info.get('product_id'):
+            pid = (
+                product_info['product_id'][0]
+                if isinstance(product_info['product_id'], (list, tuple))
+                else product_info['product_id']
+            )
+            product = models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD,
+                'product.product', 'search_read',
+                [[['id', '=', pid]]],
+                {'fields': ['id', 'name', 'list_price', 'standard_price',
+                            'default_code', 'qty_available']}
+            )
+            if product:
+                product_name = product[0]['name']
+                selling_price = (
+                    product_info.get('selling_price', 0)
+                    or product[0].get('list_price', 0)
+                    or product[0].get('standard_price', 0)
                 )
-                
-                if product:
-                    product_name = product[0]['name']
-                    selling_price = product_info.get('selling_price', 0) or product[0].get('list_price', 0) or product[0].get('standard_price', 0)
-                    # Get quantity from product if not available in lot
-                    product_qty = product[0].get('qty_available', 0)
-            
-            return {
-                'lot_no': lot_no,
-                'product_name': product_name,
-                'selling_price': float(selling_price),
-                'product_qty': float(product_qty),
-                'lot_id': product_info['id']
-            }
-        
-        return None
-        
+                product_qty = product[0].get('qty_available', 0)
+
+        return {
+            'lot_no': lot_no,
+            'product_name': product_name,
+            'selling_price': float(selling_price),
+            'product_qty': float(product_qty),
+            'lot_id': product_info['id'],
+        }
     except Exception as e:
-        st.error(f"Error fetching product: {str(e)}")
+        st.error(f"Error fetching product: {e}")
         return None
 
+
+# ---------------------------------------------------------------------------
+# SQL / Fabric Helpers
+# ---------------------------------------------------------------------------
+
 def get_sql_connection():
-    """Create SQL Alchemy connection for Fabric/SQL Server"""
     try:
-        drivers = ["ODBC Driver 18 for SQL Server", "ODBC Driver 17 for SQL Server", "ODBC Driver 13 for SQL Server"]
-        
+        drivers = [
+            "ODBC Driver 18 for SQL Server",
+            "ODBC Driver 17 for SQL Server",
+            "ODBC Driver 13 for SQL Server",
+        ]
         for driver in drivers:
             try:
-                connection_string = (
-                    f"mssql+pyodbc://{CLIENT_ID}:{urllib.parse.quote(CLIENT_SECRET)}@{SQL_ENDPOINT}"
-                    f"/{DATABASE}?driver={urllib.parse.quote(driver)}&encrypt=yes&trustservercertificate=no"
+                conn_str = (
+                    f"mssql+pyodbc://{CLIENT_ID}:{urllib.parse.quote(CLIENT_SECRET)}"
+                    f"@{SQL_ENDPOINT}/{DATABASE}"
+                    f"?driver={urllib.parse.quote(driver)}"
+                    f"&encrypt=yes&trustservercertificate=no"
                     f"&Authentication=ActiveDirectoryServicePrincipal"
                 )
-                
-                engine = create_engine(connection_string)
+                engine = create_engine(conn_str)
                 with engine.connect() as conn:
                     conn.execute(text("SELECT 1"))
                 return engine
-            except Exception as e:
+            except Exception:
                 continue
-        
         st.error("❌ No suitable ODBC driver found")
         return None
-        
     except Exception as e:
-        st.error(f"❌ SQL Connection Error: {str(e)}")
+        st.error(f"❌ SQL Connection Error: {e}")
         return None
 
-def check_record_exists(engine, lot_no):
-    """Check if a record with given lot number already exists"""
+
+def check_table_exists(engine) -> bool:
     try:
-        query = text(f"""
-            SELECT COUNT(*) as count 
-            FROM {SCHEMA}.Product_data 
-            WHERE lot_no = :lot_no
-        """)
+        q = text(
+            f"SELECT COUNT(*) FROM sys.tables "
+            f"WHERE name='Product_data' AND schema_id=SCHEMA_ID('{SCHEMA}')"
+        )
         with engine.connect() as conn:
-            result = conn.execute(query, {'lot_no': lot_no})
-            count = result.fetchone()[0]
-            return count > 0
-    except Exception as e:
-        st.error(f"Error checking existing record: {str(e)}")
+            return conn.execute(q).fetchone()[0] > 0
+    except Exception:
         return False
 
-def get_existing_record(engine, lot_no):
-    """Get existing record data for a lot number"""
+
+def check_record_exists(engine, lot_no: str) -> bool:
     try:
-        query = text(f"""
-            SELECT lot_no, product_name, selling_price, mapping_sku, shelf_info, product_qty
-            FROM {SCHEMA}.Product_data 
-            WHERE lot_no = :lot_no
-        """)
+        q = text(f"SELECT COUNT(*) FROM {SCHEMA}.Product_data WHERE lot_no=:lot_no")
         with engine.connect() as conn:
-            result = conn.execute(query, {'lot_no': lot_no})
-            row = result.fetchone()
+            return conn.execute(q, {'lot_no': lot_no}).fetchone()[0] > 0
+    except Exception as e:
+        st.error(f"Error checking existing record: {e}")
+        return False
+
+
+def get_existing_record(engine, lot_no: str):
+    try:
+        q = text(
+            f"SELECT lot_no, product_name, selling_price, mapping_sku, shelf_info, product_qty "
+            f"FROM {SCHEMA}.Product_data WHERE lot_no=:lot_no"
+        )
+        with engine.connect() as conn:
+            row = conn.execute(q, {'lot_no': lot_no}).fetchone()
             if row:
                 return {
-                    'lot_no': row[0],
-                    'product_name': row[1],
-                    'selling_price': row[2],
-                    'mapping_sku': row[3],
-                    'shelf_info': row[4],
-                    'product_qty': row[5]
+                    'lot_no': row[0], 'product_name': row[1],
+                    'selling_price': row[2], 'mapping_sku': row[3],
+                    'shelf_info': row[4], 'product_qty': row[5],
                 }
-            return None
+        return None
     except Exception as e:
-        st.error(f"Error fetching existing record: {str(e)}")
+        st.error(f"Error fetching existing record: {e}")
         return None
 
-def save_to_fabric_table(data):
-    """Save or update product data to Fabric table"""
+
+def save_to_fabric_table(data: dict):
     try:
         engine = get_sql_connection()
         if not engine:
             return False, None
-        
-        # Check if record exists
+
         exists = check_record_exists(engine, data['lot_no'])
-        
+        shelf = data.get('shelf_info', '') or ''
+
         with engine.connect() as conn:
-            shelf_info_value = data.get('shelf_info', '') or ''
-            
             if exists:
-                # Update existing record (without updated_at)
-                update_sql = text(f"""
-                    UPDATE {SCHEMA}.Product_data 
-                    SET product_name = :product_name,
-                        selling_price = :selling_price,
-                        mapping_sku = :mapping_sku,
-                        shelf_info = :shelf_info,
-                        product_qty = :product_qty
-                    WHERE lot_no = :lot_no
-                """)
-                
-                conn.execute(update_sql, {
-                    'lot_no': data['lot_no'],
-                    'product_name': data['product_name'],
-                    'selling_price': int(data['selling_price']),
-                    'mapping_sku': data['mapping_sku'],
-                    'shelf_info': shelf_info_value,
-                    'product_qty': int(data.get('product_qty', 0))
-                })
+                conn.execute(
+                    text(
+                        f"UPDATE {SCHEMA}.Product_data "
+                        f"SET product_name=:product_name, selling_price=:selling_price, "
+                        f"mapping_sku=:mapping_sku, shelf_info=:shelf_info, product_qty=:product_qty "
+                        f"WHERE lot_no=:lot_no"
+                    ),
+                    {
+                        'lot_no': data['lot_no'],
+                        'product_name': data['product_name'],
+                        'selling_price': int(data['selling_price']),
+                        'mapping_sku': data['mapping_sku'],
+                        'shelf_info': shelf,
+                        'product_qty': int(data.get('product_qty', 0)),
+                    }
+                )
                 conn.commit()
                 return True, "updated"
             else:
-                # Insert new record (without created_at)
-                insert_sql = text(f"""
-                    INSERT INTO {SCHEMA}.Product_data (lot_no, product_name, selling_price, mapping_sku, shelf_info, product_qty)
-                    VALUES (:lot_no, :product_name, :selling_price, :mapping_sku, :shelf_info, :product_qty)
-                """)
-                
-                conn.execute(insert_sql, {
-                    'lot_no': data['lot_no'],
-                    'product_name': data['product_name'],
-                    'selling_price': int(data['selling_price']),
-                    'mapping_sku': data['mapping_sku'],
-                    'shelf_info': shelf_info_value,
-                    'product_qty': int(data.get('product_qty', 0))
-                })
+                conn.execute(
+                    text(
+                        f"INSERT INTO {SCHEMA}.Product_data "
+                        f"(lot_no, product_name, selling_price, mapping_sku, shelf_info, product_qty) "
+                        f"VALUES (:lot_no,:product_name,:selling_price,:mapping_sku,:shelf_info,:product_qty)"
+                    ),
+                    {
+                        'lot_no': data['lot_no'],
+                        'product_name': data['product_name'],
+                        'selling_price': int(data['selling_price']),
+                        'mapping_sku': data['mapping_sku'],
+                        'shelf_info': shelf,
+                        'product_qty': int(data.get('product_qty', 0)),
+                    }
+                )
                 conn.commit()
                 return True, "inserted"
-        
     except Exception as e:
-        st.error(f"❌ Error saving to database: {str(e)}")
+        st.error(f"❌ Error saving to database: {e}")
         return False, None
 
+
 def show_existing_data():
-    """Display existing records from Product_data table"""
     try:
         engine = get_sql_connection()
         if not engine:
             return None
-        
-        query = f"""
-            SELECT lot_no, product_name, selling_price, mapping_sku, shelf_info, product_qty
-            FROM {SCHEMA}.Product_data 
-            ORDER BY lot_no
-        """
-        df = pd.read_sql(query, engine)
+        df = pd.read_sql(
+            f"SELECT lot_no, product_name, selling_price, mapping_sku, shelf_info "
+            f"FROM {SCHEMA}.Product_data ORDER BY lot_no",
+            engine
+        )
         return df
-        
     except Exception as e:
-        st.error(f"Error fetching existing data: {str(e)}")
+        st.error(f"Error fetching data: {e}")
         return None
 
-def check_table_exists(engine):
-    """Check if Product_data table exists"""
-    try:
-        query = text(f"""
-            SELECT COUNT(*) as count 
-            FROM sys.tables 
-            WHERE name = 'Product_data' AND schema_id = SCHEMA_ID('{SCHEMA}')
-        """)
-        with engine.connect() as conn:
-            result = conn.execute(query)
-            count = result.fetchone()[0]
-            return count > 0
-    except:
+
+# ---------------------------------------------------------------------------
+# Shared lookup helper — called from both scanner and manual-entry paths
+# ---------------------------------------------------------------------------
+
+def do_product_lookup(lot_no: str, uid, models, engine):
+    """
+    Fetches product from Odoo and pre-fills session state.
+    Returns True on success, False on failure.
+    """
+    lot_no = lot_no.strip()
+    if not lot_no:
         return False
 
-# Streamlit UI
+    # Avoid re-fetching same lot
+    if st.session_state.get('scanned_lot') == lot_no and st.session_state.get('scanned_data'):
+        return True
+
+    product_data = get_product_by_lot(lot_no, uid, models)
+    if not product_data:
+        st.session_state.lookup_error = f"❌ No product found for lot: {lot_no}"
+        st.session_state.scanned_data = None
+        return False
+
+    # Reset fields for new lot
+    st.session_state.mapping_sku_input = ""
+    st.session_state.shelf_info_input = ""
+    st.session_state.existing_record_data = None
+
+    # Check existing DB record
+    if engine:
+        existing = get_existing_record(engine, lot_no)
+        if existing:
+            st.session_state.existing_record_data = existing
+            st.session_state.mapping_sku_input = existing.get('mapping_sku', '') or ''
+            st.session_state.shelf_info_input = existing.get('shelf_info', '') or ''
+
+    st.session_state.scanned_data = product_data
+    st.session_state.scanned_lot = lot_no
+    st.session_state.lookup_error = None
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Page setup & CSS
+# ---------------------------------------------------------------------------
+
 st.set_page_config(page_title="Product Registration", layout="wide")
-# Add custom CSS for better mobile experience and reduced fonts
 
 st.markdown("""
 <style>
-    /* Reduce overall font sizes for mobile */
-    .stApp {
+    @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Sora:wght@400;600;700&display=swap');
+
+    html, body, [class*="css"] {
+        font-family: 'Sora', sans-serif !important;
+    }
+
+    .stApp { background: #0f1117; color: #e8eaf6; }
+
+    h1 { font-size: 1.6rem !important; font-weight: 700 !important; letter-spacing: -0.5px; }
+    h2, h3 { font-size: 1.15rem !important; font-weight: 600 !important; }
+
+    /* Tabs */
+    .stTabs [data-baseweb="tab-list"] {
+        background: #1a1d2e;
+        border-radius: 10px;
+        padding: 4px;
+        gap: 4px;
+    }
+    .stTabs [data-baseweb="tab"] {
+        border-radius: 8px !important;
+        font-size: 13px !important;
+        color: #8892b0 !important;
+        font-weight: 600;
+    }
+    .stTabs [aria-selected="true"] {
+        background: #3b4cca !important;
+        color: #fff !important;
+    }
+
+    /* Buttons */
+    .stButton > button {
+        background: linear-gradient(135deg, #3b4cca, #5c6ef5);
+        color: #fff !important;
+        border: none !important;
+        border-radius: 8px !important;
         font-size: 14px !important;
+        font-weight: 600 !important;
+        padding: 10px 18px !important;
+        transition: opacity 0.2s;
     }
-    
-    /* Reduce title size */
-    h1 {
-        font-size: 1.5rem !important;
-        margin-bottom: 0.5rem !important;
-    }
-    
-    /* Reduce subheader size */
-    h2, .stSubheader {
-        font-size: 1.2rem !important;
-    }
-    
-    h3 {
-        font-size: 1.1rem !important;
-    }
-    
-    /* Reduce metric labels and values */
-    [data-testid="stMetricLabel"] {
-        font-size: 0.8rem !important;
-    }
-    
-    [data-testid="stMetricValue"] {
-        font-size: 1.3rem !important;
-    }
-    
-    /* Reduce button text size */
-    .stButton button {
+    .stButton > button:hover { opacity: 0.88; }
+
+    /* Inputs */
+    .stTextInput input {
+        background: #1a1d2e !important;
+        border: 1.5px solid #2d3561 !important;
+        border-radius: 8px !important;
+        color: #e8eaf6 !important;
         font-size: 14px !important;
-        padding: 8px 12px !important;
+        font-family: 'JetBrains Mono', monospace !important;
     }
-    
-    /* Reduce input label size */
-    .stTextInput label, .stForm label {
+    .stTextInput input:focus { border-color: #5c6ef5 !important; box-shadow: 0 0 0 2px #3b4cca44 !important; }
+    .stTextInput label { font-size: 12px !important; color: #8892b0 !important; }
+
+    /* Metrics */
+    [data-testid="stMetric"] {
+        background: #1a1d2e;
+        border: 1px solid #2d3561;
+        border-radius: 10px;
+        padding: 12px 14px !important;
+    }
+    [data-testid="stMetricLabel"] { font-size: 11px !important; color: #8892b0 !important; }
+    [data-testid="stMetricValue"] { font-size: 1.1rem !important; color: #e8eaf6 !important; font-family: 'JetBrains Mono', monospace !important; }
+
+    /* Alerts */
+    .stAlert { font-size: 13px !important; border-radius: 8px !important; }
+
+    /* Dataframe */
+    .stDataFrame { font-size: 12px !important; }
+
+    /* Form submit */
+    [data-testid="stFormSubmitButton"] > button {
+        background: linear-gradient(135deg, #00c9a7, #00a389) !important;
+        width: 100% !important;
+        font-size: 15px !important;
+        padding: 12px !important;
+    }
+
+    /* Download button */
+    .stDownloadButton > button {
+        background: #1a1d2e !important;
+        border: 1.5px solid #2d3561 !important;
+        color: #8892b0 !important;
         font-size: 13px !important;
     }
-    
-    /* Reduce info/warning/success message text */
-    .stAlert {
-        font-size: 13px !important;
-        padding: 8px !important;
+
+    /* Divider */
+    hr { border-color: #2d3561 !important; margin: 1rem 0 !important; }
+
+    /* Scan badge */
+    .scan-badge {
+        display: inline-block;
+        background: #00c9a7;
+        color: #0f1117;
+        border-radius: 20px;
+        padding: 3px 12px;
+        font-size: 12px;
+        font-weight: 700;
+        font-family: 'JetBrains Mono', monospace;
+        animation: pulse 1.5s infinite;
     }
-    
-    /* Reduce dataframe font size */
-    .stDataFrame {
-        font-size: 12px !important;
-    }
-    
-    /* Reduce tabs font size */
-    .stTabs [data-baseweb="tab-list"] button [data-testid="stMarkdownContainer"] p {
-        font-size: 13px !important;
-    }
-    
-    /* Reduce caption text */
-    .caption, stCaption {
-        font-size: 11px !important;
-    }
-    
-    /* Make containers more compact */
-    .stContainer {
-        padding: 0.5rem !important;
-    }
-    
-    /* Reduce spacing between elements */
-    .element-container {
-        margin-bottom: 0.5rem !important;
-    }
-    
-    /* Make columns more compact on mobile */
-    @media (max-width: 768px) {
-        .stColumn {
-            padding: 0 5px !important;
-        }
-        
-        /* Hide empty columns on mobile */
-        .stColumn:empty {
-            display: none;
-        }
-        
-        /* Reduce metric container padding */
-        [data-testid="stMetric"] {
-            padding: 8px !important;
-        }
-    }
-    
-    /* Make camera input more compact */
-    [data-testid="stCameraInput"] {
-        margin-bottom: 0.5rem !important;
-    }
-    
-    /* Reduce form spacing */
-    .stForm {
-        gap: 0.5rem !important;
-    }
-    
-    /* Make download button smaller */
-    .stDownloadButton button {
-        font-size: 13px !important;
-        padding: 6px 10px !important;
+    @keyframes pulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.55; }
     }
 </style>
 """, unsafe_allow_html=True)
 
-st.title("📦 Product Registration with Barcode Scanner")
+
+# ---------------------------------------------------------------------------
+# Session state initialisation
+# ---------------------------------------------------------------------------
+
+for key, default in {
+    'scanned_data': None,
+    'scanned_lot': None,
+    'existing_record_data': None,
+    'lookup_error': None,
+    'mapping_sku_input': '',
+    'shelf_info_input': '',
+    'manual_lot_trigger': '',   # tracks last auto-looked-up manual lot
+}.items():
+    if key not in st.session_state:
+        st.session_state[key] = default
+
+
+# ---------------------------------------------------------------------------
+# App entry
+# ---------------------------------------------------------------------------
+
+st.title("📦 Product Registration")
 st.markdown("---")
 
-# Initialize session state
-if 'scanned_data' not in st.session_state:
-    st.session_state.scanned_data = None
-if 'scanned_lot' not in st.session_state:
-    st.session_state.scanned_lot = None
-if 'auto_lookup' not in st.session_state:
-    st.session_state.auto_lookup = False
-if 'existing_record_data' not in st.session_state:
-    st.session_state.existing_record_data = None
-
-# Check database connection and table existence
+# DB + Odoo connections
 engine = get_sql_connection()
 if engine:
-    table_exists = check_table_exists(engine)
-    if not table_exists:
-        st.error(f"❌ Table {SCHEMA}.Product_data does not exist in the database!")
+    if not check_table_exists(engine):
+        st.error(f"❌ Table `{SCHEMA}.Product_data` does not exist.")
         st.stop()
 
-# Connect to Odoo
 uid, models = get_odoo_connection()
+if not (uid and models):
+    st.error("❌ Failed to connect to Odoo. Check your credentials.")
+    st.stop()
 
-if uid and models:
-    # Create tabs for different input methods
-    tab1, tab2 = st.tabs(["📷 Camera Scanner", "⌨️ Manual Entry"])
-    
-    with tab1:
-        barcode_image = st.camera_input("Position the barcode in frame", key="mobile_scanner")
-        
-        if barcode_image:
-            import pyrxing
-            from PIL import Image, ImageEnhance, ImageFilter
-            import cv2
-            import numpy as np
-            
-            # Open image
-            image = Image.open(barcode_image)
-            
-            # Convert to RGB if needed
-            if image.mode != 'RGB':
-                image = image.convert('RGB')
-            
-            # Try multiple preprocessing techniques
-            barcode_found = False
-            scanned_value = None
-            
-            # Method 1: Original image
-            result = pyrxing.read_barcode(image)
-            if result:
-                scanned_value = result.text
-                barcode_found = True
-            
-            # Method 2: Convert to grayscale and back to RGB
-            if not barcode_found:
-                gray = image.convert('L')
-                gray_rgb = gray.convert('RGB')
-                result = pyrxing.read_barcode(gray_rgb)
-                if result:
-                    scanned_value = result.text
-                    barcode_found = True
-            
-            # Method 3: Increase contrast
-            if not barcode_found:
-                enhancer = ImageEnhance.Contrast(image)
-                high_contrast = enhancer.enhance(2.5)
-                result = pyrxing.read_barcode(high_contrast)
-                if result:
-                    scanned_value = result.text
-                    barcode_found = True
-            
-            # Method 4: Sharpen image
-            if not barcode_found:
-                sharpened = image.filter(ImageFilter.UnsharpMask(radius=2, percent=150, threshold=3))
-                result = pyrxing.read_barcode(sharpened)
-                if result:
-                    scanned_value = result.text
-                    barcode_found = True
-            
-            # Method 5: Resize (make larger)
-            if not barcode_found:
-                width, height = image.size
-                enlarged = image.resize((width*3, height*3), Image.Resampling.LANCZOS)
-                result = pyrxing.read_barcode(enlarged)
-                if result:
-                    scanned_value = result.text
-                    barcode_found = True
-            
-            # Method 6: Denoise
-            if not barcode_found:
-                img_array = np.array(image)
-                denoised = cv2.fastNlMeansDenoisingColored(img_array, None, 10, 10, 7, 21)
-                denoised_pil = Image.fromarray(denoised)
-                result = pyrxing.read_barcode(denoised_pil)
-                if result:
-                    scanned_value = result.text
-                    barcode_found = True
-            
-            if barcode_found:
-                if st.session_state.get('scanned_lot') != scanned_value:
-                    st.session_state.mapping_sku_input = ""
-                    st.session_state.shelf_info_input = ""
-                    st.session_state.existing_record_data = None
-                    
-                with st.spinner("Fetching product details..."):
-                    product_data = get_product_by_lot(scanned_value.strip(), uid, models)
-                    
-                    if product_data:
-                        # Check if record exists in Fabric table
-                        if engine:
-                            existing_record = get_existing_record(engine, scanned_value.strip())
-                            if existing_record:
-                                st.session_state.existing_record_data = existing_record
-                                st.warning(f"⚠️ Lot number {scanned_value} already exists in database. The record will be UPDATED with new information.")
-                                # Pre-fill the form with existing data
-                                st.session_state.mapping_sku_input = existing_record.get('mapping_sku', '')
-                                st.session_state.shelf_info_input = existing_record.get('shelf_info', '')
-                        
-                        st.session_state.scanned_data = product_data
-                        st.session_state.scanned_lot = scanned_value
-                        st.success(f"✅ Product found: {product_data['product_name']}")
-                    else:
-                        st.error("❌ No product found for this barcode")
-                        st.session_state.scanned_data = None
-            else:
-                st.error("❌ Could not read barcode. Please try:")
-                st.markdown("• Hold the phone steady for 2 seconds")
-                st.markdown("• Ensure good lighting")
-                st.markdown("• Place barcode flat and straight")
-                
-    with tab2:
-        st.subheader("⌨️ Lot Number Entry")
-        
-        # Barcode/Lot number input
-        lot_input = st.text_input(
-            "Enter Lot Number:",
-            key="manual_lot_input",
-            placeholder="Enter lot number..."
-        )
-        # st.markdown("""
-        # <script>
-        #     document.querySelector('input[aria-label="Enter Lot Number:"]')?.focus();
-        # </script>
-        # """, unsafe_allow_html=True)
-        # Lookup button
-        if st.button("🔍 Lookup Product", type="primary", width='stretch'):
-            if lot_input:
-                if st.session_state.get('scanned_lot') != lot_input:
-                    st.session_state.mapping_sku_input = ""
-                    st.session_state.shelf_info_input = ""
-                    st.session_state.existing_record_data = None
-                    
-                with st.spinner("Fetching product details from Odoo..."):
-                    product_data = get_product_by_lot(lot_input.strip(), uid, models)
-                    
-                    if product_data:
-                        # Check if record exists in Fabric table
-                        if engine:
-                            existing_record = get_existing_record(engine, lot_input.strip())
-                            if existing_record:
-                                st.session_state.existing_record_data = existing_record
-                                # st.warning(f"⚠️ Lot number {lot_input} already exists in database. The record will be UPDATED with new information.")
-                                # Pre-fill the form with existing data
-                                st.session_state.mapping_sku_input = existing_record.get('mapping_sku', '')
-                                st.session_state.shelf_info_input = existing_record.get('shelf_info', '')
-                        
-                        st.session_state.scanned_data = product_data
-                        st.session_state.scanned_lot = lot_input
-                        st.success(f"✅ Product found: {product_data['product_name']}")
-                        # if product_data.get('product_qty', 0) > 0:
-                        #     st.info(f"📦 Available Quantity: {product_data['product_qty']:.2f} units")
-                    else:
-                        st.error("❌ No product found for this lot number")
-                        st.session_state.scanned_data = None
-            else:
-                st.warning("⚠️ Please enter a lot number")
-    
-    # Product Details and Form (Common for both tabs)
-    st.markdown("---")
-    st.subheader("📝 Product Details")
-    
-    # Display fetched product information
-    if st.session_state.scanned_data:
-        product = st.session_state.scanned_data
-        
-        # Display product info in a nice container
-        with st.container():
-            col_info1, col_info2, col_info3, col_info4 = st.columns(4)
-            with col_info1:
-                st.metric("🏷️ Lot Number", product['lot_no'])
-            with col_info2:
-                st.metric("📦 Product Name", product['product_name'][:30] + "..." if len(product['product_name']) > 30 else product['product_name'])
-            with col_info3:
-                st.metric("💰 Selling Price", f"₹{product['selling_price']:,.2f}")
-            # with col_info4:
-            #     st.metric("📊 Available Quantity", f"{product['product_qty']:.2f} units" if product['product_qty'] > 0 else "Out of Stock")
-        
-        # Show existing record info if updating
-        if st.session_state.existing_record_data:
-            st.info(f"📝 **Updating existing record** - Current Mapping SKU: {st.session_state.existing_record_data.get('mapping_sku', 'N/A')}")
-        
-        # Form for additional data
-        with st.form(key="product_registration_form"):
-            st.subheader("➕ Additional Information")
-            
-            mapping_sku = st.text_input(
-                "📌 Mapping SKU *:",
-                placeholder="Enter mapping SKU...",
-                help="SKU mapping for internal reference (Required)",
-                key="mapping_sku_input",
-                # value=st.session_state.get('mapping_sku_input', '')
+
+# ---------------------------------------------------------------------------
+# Tabs
+# ---------------------------------------------------------------------------
+
+tab1, tab2 = st.tabs(["📷 Live Scanner", "⌨️ Manual Entry"])
+
+# ── Tab 1: Real-time WebRTC scanner ────────────────────────────────────────
+with tab1:
+    st.markdown(
+        "Point camera at a barcode — product will load **automatically** once detected."
+    )
+
+    scanner = webrtc_streamer(
+        key="barcode_scanner",
+        mode=WebRtcMode.SENDRECV,
+        video_transformer_factory=BarcodeScanner,
+        media_stream_constraints={"video": {"facingMode": "environment"}, "audio": False},
+        async_transform=True,
+    )
+
+    # Poll the scanner's result queue every Streamlit rerun
+    if scanner.video_transformer:
+        transformer: BarcodeScanner = scanner.video_transformer
+        try:
+            detected_lot = transformer.result_queue.get_nowait()
+        except queue.Empty:
+            detected_lot = None
+
+        if detected_lot and detected_lot != st.session_state.scanned_lot:
+            st.markdown(
+                f'<span class="scan-badge">● DETECTED: {detected_lot}</span>',
+                unsafe_allow_html=True
             )
-            
-            shelf_info = st.text_input(
-                "📍 Shelf Information (Optional):",
-                placeholder="Enter shelf/rack location...",
-                help="Physical location of the product - not mandatory",
-                key="shelf_info_input",
-                # value=st.session_state.get('shelf_info_input', '')
-            )
-            
-            # Submit button
-            submit_label = "🔄 Update Database" if st.session_state.existing_record_data else "💾 Save to Database"
-            submitted = st.form_submit_button(submit_label, type="primary", width='stretch')
-            
-            if submitted:
-                if mapping_sku:
-                    # Prepare data for saving
-                    save_data = {
-                        'lot_no': product['lot_no'],
-                        'product_name': product['product_name'],
-                        'selling_price': product['selling_price'],
-                        'mapping_sku': mapping_sku,
-                        'shelf_info': shelf_info if shelf_info else '',
-                        'product_qty': product['product_qty']
-                    }
-                    
-                    with st.spinner("Saving to database..."):
-                        success, action = save_to_fabric_table(save_data)
-                        if success:
-                            if action == "updated":
-                                st.success("✅ Product data updated successfully!")
-                            else:
-                                st.success("✅ Product data saved successfully!")
-                            # Clear the scanned data after successful save
-                            st.session_state.scanned_data = None
-                            st.session_state.scanned_lot = None
-                            st.session_state.existing_record_data = None
-                            st.rerun()
-                        else:
-                            st.error("❌ Failed to save data")
-                else:
-                    st.warning("⚠️ Please fill Mapping SKU field (Required)")
-    else:
-        st.info("👆 Scan a barcode using camera or enter lot number manually to see product details")
-    
-    # Display existing records
-    st.markdown("---")
-    st.subheader("📊 Existing Product Records")
-    
-    # Refresh button
-    col_refresh, col_empty = st.columns([1, 4])
-    with col_refresh:
-        if st.button("🔄 Refresh Data", width='stretch'):
+            with st.spinner("Fetching product from Odoo…"):
+                ok = do_product_lookup(detected_lot, uid, models, engine)
+            if ok:
+                st.success(f"✅ Auto-fetched: {st.session_state.scanned_data['product_name']}")
+            else:
+                st.error(st.session_state.lookup_error or "❌ Product not found")
+            # Force a rerun so the product details section below refreshes
             st.rerun()
-    
-    # Show data table
-    df = show_existing_data()
-    if df is not None and not df.empty:
-        if 'product_qty' in df.columns:
-            df = df.drop(columns=['product_qty'])
-        st.dataframe(
-            df,
-            width='stretch',
-            column_config={
-                "lot_no": "🏷️ Lot Number",
-                "product_name": "📦 Product Name",
-                "selling_price": st.column_config.NumberColumn("💰 Selling Price (₹)", format="₹%d"),
-                "mapping_sku": "📌 Mapping SKU",
-                "shelf_info": "📍 Shelf Info"
-                # "product_qty": st.column_config.NumberColumn("📊 Quantity", format="%.2f")
-            },
-            hide_index=True
+
+    st.caption(
+        "💡 Tip: The scanner uses your rear camera. Make sure lighting is good and "
+        "hold the barcode steady for ~1 second."
+    )
+
+# ── Tab 2: Manual Entry — auto-fetch on Enter (no button needed) ────────────
+with tab2:
+    st.subheader("⌨️ Lot Number Entry")
+
+    def _on_manual_lot_change():
+        """Called when the text input value changes (on Enter / focus-out)."""
+        lot = st.session_state.get('_manual_lot_input_widget', '').strip()
+        if not lot:
+            return
+        # Avoid duplicate lookups
+        if lot == st.session_state.manual_lot_trigger:
+            return
+        st.session_state.manual_lot_trigger = lot
+        do_product_lookup(lot, uid, models, engine)
+
+    st.text_input(
+        "Enter Lot Number (press Enter to auto-fetch):",
+        key="_manual_lot_input_widget",
+        placeholder="Scan with barcode gun or type manually…",
+        on_change=_on_manual_lot_change,
+    )
+
+    # Show inline feedback for manual entry
+    if st.session_state.lookup_error and not st.session_state.scanned_data:
+        st.error(st.session_state.lookup_error)
+    elif st.session_state.scanned_data:
+        st.success(f"✅ Auto-fetched: {st.session_state.scanned_data['product_name']}")
+
+
+# ---------------------------------------------------------------------------
+# Product Details + Save Form (shared by both tabs)
+# ---------------------------------------------------------------------------
+
+st.markdown("---")
+st.subheader("📝 Product Details")
+
+if st.session_state.scanned_data:
+    product = st.session_state.scanned_data
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("🏷️ Lot Number", product['lot_no'])
+    with col2:
+        name = product['product_name']
+        st.metric("📦 Product", name[:28] + "…" if len(name) > 28 else name)
+    with col3:
+        st.metric("💰 Selling Price", f"₹{product['selling_price']:,.2f}")
+
+    if st.session_state.existing_record_data:
+        st.info(
+            f"📝 **Updating existing record** — "
+            f"Current SKU: `{st.session_state.existing_record_data.get('mapping_sku', 'N/A')}`"
         )
-        
-        # Download option
-        csv = df.to_csv(index=False)
-        st.download_button(
-            label="📥 Download Data as CSV",
-            data=csv,
-            file_name="product_data_export.csv",
-            mime="text/csv",
-            width='stretch'
+
+    with st.form("product_registration_form"):
+        st.subheader("➕ Additional Information")
+
+        mapping_sku = st.text_input(
+            "📌 Mapping SKU *",
+            placeholder="Enter mapping SKU…",
+            help="Required",
+            key="mapping_sku_input",
         )
-        
-        # Show record count
-        st.info(f"📊 Total records: {len(df)}")
-    else:
-        st.info("No records found in the database. Scan and save your first product!")
+
+        shelf_info = st.text_input(
+            "📍 Shelf Info (optional)",
+            placeholder="e.g. A3-Row2…",
+            key="shelf_info_input",
+        )
+
+        label = "🔄 Update Database" if st.session_state.existing_record_data else "💾 Save to Database"
+        submitted = st.form_submit_button(label, type="primary", use_container_width=True)
+
+        if submitted:
+            if not mapping_sku:
+                st.warning("⚠️ Mapping SKU is required.")
+            else:
+                save_data = {
+                    'lot_no': product['lot_no'],
+                    'product_name': product['product_name'],
+                    'selling_price': product['selling_price'],
+                    'mapping_sku': mapping_sku,
+                    'shelf_info': shelf_info or '',
+                    'product_qty': product['product_qty'],
+                }
+                with st.spinner("Saving…"):
+                    ok, action = save_to_fabric_table(save_data)
+                if ok:
+                    verb = "updated" if action == "updated" else "saved"
+                    st.success(f"✅ Product data {verb} successfully!")
+                    # Clear state
+                    for k in ('scanned_data', 'scanned_lot', 'existing_record_data',
+                              'lookup_error', 'manual_lot_trigger'):
+                        st.session_state[k] = None
+                    st.session_state.mapping_sku_input = ''
+                    st.session_state.shelf_info_input = ''
+                    st.rerun()
+                else:
+                    st.error("❌ Failed to save data.")
 
 else:
-    st.error("Failed to connect to Odoo. Please check your credentials.")
+    st.info("👆 Scan a barcode or enter a lot number above to load product details.")
+
+
+# ---------------------------------------------------------------------------
+# Existing Records Table
+# ---------------------------------------------------------------------------
+
+st.markdown("---")
+st.subheader("📊 Existing Product Records")
+
+col_r, _ = st.columns([1, 5])
+with col_r:
+    if st.button("🔄 Refresh"):
+        st.rerun()
+
+df = show_existing_data()
+if df is not None and not df.empty:
+    st.dataframe(
+        df,
+        use_container_width=True,
+        column_config={
+            "lot_no": "🏷️ Lot No.",
+            "product_name": "📦 Product Name",
+            "selling_price": st.column_config.NumberColumn("💰 Price (₹)", format="₹%d"),
+            "mapping_sku": "📌 Mapping SKU",
+            "shelf_info": "📍 Shelf Info",
+        },
+        hide_index=True,
+    )
+    csv = df.to_csv(index=False)
+    st.download_button(
+        "📥 Download CSV",
+        data=csv,
+        file_name="product_data_export.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+    st.info(f"📊 Total records: {len(df)}")
+else:
+    st.info("No records yet. Scan and save your first product!")
 
 # Footer
 st.markdown("---")
-st.markdown("### 📋 Instructions:")
 st.markdown("""
-1. **Camera Scanner Tab**: Point your phone camera at the barcode - it will scan automatically!
-2. **Manual Entry Tab**: Type lot number if camera doesn't work
-3. Product details will auto-fetch from Odoo
-4. Enter **Mapping SKU** (required) and **Shelf Info** (optional)
-5. Click **Save to Database** to store the information
-6. **If a lot number already exists**, the system will update the existing record instead of creating a duplicate
+**Instructions:**
+1. **Live Scanner** — point camera at barcode; product auto-loads once detected (3-second cooldown between scans).
+2. **Manual Entry** — type/scan lot number and press **Enter**; product auto-loads instantly.
+3. Fill in **Mapping SKU** (required) and **Shelf Info** (optional).
+4. Click **Save / Update** — existing lot numbers are updated, new ones are inserted.
 """)
